@@ -1,0 +1,13 @@
+streamlit
+streamlit-folium
+folium
+osmnx
+networkx
+stable-baselines3
+scikit-learn
+shimmy
+gymnasium
+numpy
+pandas
+requests
+
