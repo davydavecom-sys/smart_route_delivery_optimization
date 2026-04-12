@@ -10,4 +10,5 @@ gymnasium
 numpy
 pandas
 requests
-
+psycopg2-binary
+werkzeug
