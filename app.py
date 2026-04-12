@@ -23,6 +23,17 @@ def get_connection():
         st.error(f"Failed to connect to the database: {e}")
         return None
 
+
+conn = get_connection()
+if conn:
+    # RealDictCursor allows you to access columns by name: user['username']
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT version();")
+    db_version = cur.fetchone()
+    st.write(f"Connected to: {db_version}")
+    cur.close()
+    conn.close()
+
 # --- 2. DATABASE REPAIR (FORCING WRITE ACCESS) ---
 def force_db_setup():
     """Bypasses Aiven Web UI restrictions to create tables via Python."""
