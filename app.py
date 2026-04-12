@@ -1,122 +1,150 @@
 import streamlit as st
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from werkzeug.security import generate_password_hash, check_password_hash
+import pandas as pd
 import folium
 from streamlit_folium import st_folium
-import osmnx as ox
-from stable_baselines3 import PPO
-import networkx as nx
-import os
 
-# --- 1. CONFIG & ASSETS ---
-st.set_page_config(page_title="Nairobi Multi-Stop AI", layout="wide")
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="SmartRoute Nairobi", layout="wide")
 
-@st.cache_resource
-def load_assets():
-    model_path = "nairobi_smart_delivery_v1.zip"
-    model = PPO.load(model_path) if os.path.exists(model_path) else None
-    # Loading a larger 5km radius to cover more delivery areas
+# --- 2. DATABASE REPAIR (FORCING WRITE ACCESS) ---
+def force_db_setup():
+    """Bypasses Aiven Web UI restrictions to create tables via Python."""
     try:
-        G = ox.graph_from_point((-1.286389, 36.817223), dist=5000, network_type='drive')
+        conn = psycopg2.connect(st.secrets["DB_URL"])
+        cur = conn.cursor()
+        
+        # Create Users Table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'client'
+            );
+        """)
+        
+        # Create Activity Logs Table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS activity_logs (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                action TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # Create a Default Admin Account
+        admin_user = "admin123"
+        admin_pass = generate_password_hash("nairobi2026")
+        cur.execute("""
+            INSERT INTO users (username, password_hash, role)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (username) DO NOTHING;
+        """, (admin_user, admin_pass, 'admin'))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        st.success("✅ Success! Database tables created and Admin (admin123) added.")
+    except Exception as e:
+        st.error(f"❌ Force Setup Failed: {e}")
+
+# --- 3. CORE LOGIC ---
+def get_connection():
+    return psycopg2.connect(st.secrets["DB_URL"])
+
+def log_activity(username, action):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO activity_logs (username, action) VALUES (%s, %s)", (username, action))
+        conn.commit()
+        cur.close()
+        conn.close()
     except:
-        G = None
-    return model, G
+        pass
 
-model, G = load_assets()
+# --- 4. INTERFACE ---
+if 'logged_in' not in st.session_state:
+    st.session_state.update({'logged_in': False, 'username': None, 'role': 'client', 'zip_url': ""})
 
-# --- 2. SESSION STATE ---
-if 'optimized_path' not in st.session_state:
-    st.session_state.optimized_path = None
-if 'ordered_labels' not in st.session_state:
-    st.session_state.ordered_labels = []
+def main():
+    if not st.session_state.logged_in:
+        st.title("🚚 Nairobi SmartRoute Login")
+        
+        with st.form("auth_form"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            mode = st.radio("Mode", ["Login", "Register"])
+            submit = st.form_submit_button("Submit")
+            
+            if submit:
+                conn = get_connection()
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                if mode == "Login":
+                    cur.execute("SELECT * FROM users WHERE username = %s", (u,))
+                    user = cur.fetchone()
+                    if user and check_password_hash(user['password_hash'], p):
+                        st.session_state.logged_in = True
+                        st.session_state.username = user['username']
+                        st.session_state.role = user['role']
+                        log_activity(u, "Logged In")
+                        st.rerun()
+                    else:
+                        st.error("Invalid credentials")
+                else:
+                    try:
+                        cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", (u, generate_password_hash(p)))
+                        conn.commit()
+                        st.success("Registered! Switch to Login mode.")
+                    except:
+                        st.error("Username taken.")
+                conn.close()
+        
+        st.divider()
+        if st.button("🛠 System: Initialize Database & Admin"):
+            force_db_setup()
 
-# --- 3. DELIVERY LOCATIONS ---
-locations = {
-    "Nairobi CBD": (-1.286389, 36.817223),
-    "Westlands": (-1.3115, 36.8117),
-    "Upper Hill": (-1.2997, 36.8143),
-    "Kilimani": (-1.2921, 36.7845),
-    "Kasarani": (-1.2268, 36.8938),
-    "South C": (-1.3265, 36.8256),
-    "Eastleigh": (-1.2748, 36.8465),
-    "Karen": (-1.3201, 36.7024)
-}
-
-# --- 4. SIDEBAR ---
-st.sidebar.title("📦 Smart Dispatcher")
-start_node_label = st.sidebar.selectbox("Current Location (Start)", list(locations.keys()))
-delivery_stops = st.sidebar.multiselect("Select All Pickups & Drops (In any order)", 
-                                        [k for k in locations.keys() if k != start_node_label])
-
-optimize_btn = st.sidebar.button("⛽ Optimize Fuel & Time", use_container_width=True)
-
-# --- 5. THE OPTIMIZATION ENGINE ---
-def get_best_sequence(start_label, stops_list):
-    """Reorders stops to minimize total distance (Greedy TSP)"""
-    ordered = [start_label]
-    remaining = list(stops_list)
-    
-    current_label = start_label
-    while remaining:
-        # Find the physically closest stop to the current location
-        next_label = min(remaining, key=lambda x: ox.distance.euclidean(
-            locations[current_label][0], locations[current_label][1],
-            locations[x][0], locations[x][1]
-        ))
-        ordered.append(next_label)
-        remaining.remove(next_label)
-        current_label = next_label
-    return ordered
-
-if optimize_btn:
-    if not delivery_stops:
-        st.error("Please select at least one delivery stop.")
     else:
-        with st.spinner("Reordering stops to save fuel..."):
-            # A. AUTO-REORDER (The Manager)
-            best_sequence = get_best_sequence(start_node_label, delivery_stops)
-            st.session_state.ordered_labels = best_sequence
+        # LOGGED IN VIEW
+        st.sidebar.title(f"User: {st.session_state.username} ({st.session_state.role})")
+        page = st.sidebar.radio("Go to", ["Route Optimizer", "Admin Panel"]) if st.session_state.role == 'admin' else ["Route Optimizer"]
+
+        if "Route Optimizer" in page:
+            st.header("📍 Route Comparison & ETA")
+            dest = st.selectbox("Destination from CBD", ["Westlands", "Kasarani", "Karen", "Mombasa Road"])
             
-            # B. NAVIGATE EACH LEG (The AI Model)
-            full_coords = []
-            for i in range(len(best_sequence) - 1):
-                loc_a = locations[best_sequence[i]]
-                loc_b = locations[best_sequence[i+1]]
-                
-                node_a = ox.distance.nearest_nodes(G, X=loc_a[1], Y=loc_a[0])
-                node_b = ox.distance.nearest_nodes(G, X=loc_b[1], Y=loc_b[0])
-                
-                # Here, the model's learned 'weights' would guide the path
-                # For this UI, we use the shortest path between the optimized stops
-                path = nx.shortest_path(G, node_a, node_b, weight='length')
-                for node in path:
-                    full_coords.append((G.nodes[node]['y'], G.nodes[node]['x']))
-            
-            st.session_state.optimized_path = full_coords
+            # Map Logic
+            m = folium.Map(location=[-1.286389, 36.817223], zoom_start=12) # Nairobi CBD
+            folium.Marker([-1.286389, 36.817223], popup="CBD Start", icon=folium.Icon(color='red')).add_to(m)
+            st_folium(m, width=700, height=300)
 
-# --- 6. MAP & DISPLAY ---
-st.title("🚀 Nairobi AI Fleet Optimizer")
+            # Data Comparison Table
+            data = {
+                "Route Type": ["Main Highway", "Bypass", "Side Streets"],
+                "Distance (km)": [8.5, 12.1, 7.8],
+                "ETA": ["15 mins", "18 mins", "25 mins"]
+            }
+            st.table(pd.DataFrame(data))
 
-if st.session_state.ordered_labels:
-    st.subheader("Optimized Manifest")
-    # Show the sequence to the driver
-    arrow_path = " ⮕ ".join([f"**{lbl}**" for lbl in st.session_state.ordered_labels])
-    st.markdown(arrow_path)
+        elif "Admin Panel" in page:
+            st.header("🛠 Admin Controls")
+            new_zip = st.text_input("Update Model ZIP URL", st.session_state.zip_url)
+            if st.button("Update Model Path"):
+                st.session_state.zip_url = new_zip
+                st.success("Updated!")
 
-# Build Map
-m = folium.Map(location=locations["Nairobi CBD"], zoom_start=12, tiles="cartodbpositron")
+            st.subheader("Interaction Logs")
+            conn = get_connection()
+            logs = pd.read_sql("SELECT * FROM activity_logs ORDER BY timestamp DESC", conn)
+            st.dataframe(logs)
+            conn.close()
 
-if st.session_state.optimized_path:
-    # Draw the AI's full path
-    folium.PolyLine(st.session_state.optimized_path, color="#2A9D8F", weight=6).add_to(m)
-    
-    # Place markers in the correct order
-    for idx, label in enumerate(st.session_state.ordered_labels):
-        color = 'blue' if idx == 0 else ('red' if idx == len(st.session_state.ordered_labels)-1 else 'green')
-        folium.Marker(
-            locations[label], 
-            popup=f"Stop {idx}: {label}",
-            icon=folium.Icon(color=color, icon='play' if idx==0 else 'info-sign')
-        ).add_to(m)
-    
-    m.fit_bounds(st.session_state.optimized_path)
+        if st.sidebar.button("Logout"):
+            st.session_state.logged_in = False
+            st.rerun()
 
-st_folium(m, width=1200, height=550, key="nairobi_delivery_map")
+main()
