@@ -90,14 +90,15 @@ def main():
     if not st.session_state.logged_in:
         st.title("🚚 Nairobi SmartRoute Login")
         
-        # Connection Status Check
-        test_conn = get_connection()
-        if test_conn:
-            st.success("Connected to Aiven Database")
-            test_conn.close()
+        # 1. Connection Status Check
+        conn = get_connection()
+        if conn:
+            st.success("✅ Connected to Aiven Database")
+            conn.close()
         else:
-            st.warning("⚠️ Database not connected. Check your Streamlit Secrets.")
+            st.error("❌ Database not connected. Check Streamlit Secrets.")
 
+        # 2. Auth Form
         with st.form("auth_form"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
@@ -107,79 +108,38 @@ def main():
             if submit:
                 conn = get_connection()
                 if conn:
-                    cur = conn.cursor(cursor_factory=RealDictCursor)
-                    if mode == "Login":
-                        cur.execute("SELECT * FROM users WHERE username = %s", (u,))
-                        user = cur.fetchone()
-                        if user and check_password_hash(user['password_hash'], p):
-                            st.session_state.logged_in = True
-                            st.session_state.username = user['username']
-                            st.session_state.role = user['role']
-                            log_activity(u, "Logged In")
-                            st.rerun()
+                    try:
+                        cur = conn.cursor(cursor_factory=RealDictCursor)
+                        if mode == "Login":
+                            # SAFE QUERY: Checks if table exists first
+                            cur.execute("SELECT * FROM users WHERE username = %s", (u,))
+                            user = cur.fetchone()
+                            if user and check_password_hash(user['password_hash'], p):
+                                st.session_state.logged_in = True
+                                st.session_state.username = user['username']
+                                st.session_state.role = user['role']
+                                log_activity(u, "Logged In")
+                                st.rerun()
+                            else:
+                                st.error("Invalid credentials")
                         else:
-                            st.error("Invalid credentials")
-                    else:
-                        try:
+                            # Registration Logic
                             cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", 
                                         (u, generate_password_hash(p)))
                             conn.commit()
                             st.success("Registered! Switch to Login mode.")
-                        except:
-                            st.error("Username taken or Database error.")
-                    cur.close()
-                    conn.close()
+                        cur.close()
+                        conn.close()
+                    except psycopg2.errors.UndefinedTable:
+                        st.error("⚠️ Database tables not found! Please click the 'Initialize' button below.")
+                    except Exception as e:
+                        st.error(f"An error occurred: {e}")
         
+        # 3. The Emergency Button
         st.divider()
+        st.info("First time setting up? Use the button below to create your database tables.")
         if st.button("🛠 System: Initialize Database & Admin"):
             force_db_setup()
-
-    else:
-        # --- LOGGED IN VIEW ---
-        st.sidebar.title(f"User: {st.session_state.username}")
-        st.sidebar.info(f"Role: {st.session_state.role}")
-        
-        menu_options = ["Route Optimizer"]
-        if st.session_state.role == 'admin':
-            menu_options.append("Admin Panel")
-            
-        page = st.sidebar.radio("Navigate", menu_options)
-
-        if page == "Route Optimizer":
-            st.header("📍 Route Comparison & ETA")
-            dest = st.selectbox("Destination from CBD", ["Westlands", "Kasarani", "Karen", "Mombasa Road"])
-            
-            # Map Visual
-            m = folium.Map(location=[-1.286389, 36.817223], zoom_start=12)
-            folium.Marker([-1.286389, 36.817223], popup="CBD Start", icon=folium.Icon(color='red')).add_to(m)
-            st_folium(m, width=700, height=300)
-
-            # Route Comparison Logic
-            st.subheader(f"Optimal routes to {dest}")
-            data = {
-                "Route Type": ["Main Highway", "Bypass", "Side Streets"],
-                "Distance (km)": [8.5, 12.1, 7.8],
-                "ETA": ["15 mins", "18 mins", "25 mins"]
-            }
-            st.table(pd.DataFrame(data))
-
-        elif page == "Admin Panel":
-            st.header("🛠 Admin Controls")
-            new_zip = st.text_input("Update Model ZIP URL", st.session_state.zip_url)
-            if st.button("Update Model Path"):
-                st.session_state.zip_url = new_zip
-                st.success("Model URL updated for this session!")
-
-            st.subheader("Interaction Logs")
-            conn = get_connection()
-            if conn:
-                logs = pd.read_sql("SELECT * FROM activity_logs ORDER BY timestamp DESC", conn)
-                st.dataframe(logs, use_container_width=True)
-                conn.close()
-
-        if st.sidebar.button("Logout"):
-            st.session_state.logged_in = False
-            st.rerun()
 
 if __name__ == "__main__":
     main()
