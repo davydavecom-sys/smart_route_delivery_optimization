@@ -12,3 +12,4 @@ pandas
 requests
 psycopg2-binary
 werkzeug
+streamlit_js_eval
