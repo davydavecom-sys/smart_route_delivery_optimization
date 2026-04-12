@@ -6,63 +6,24 @@ import pandas as pd
 import folium
 from streamlit_folium import st_folium
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="SmartRoute Nairobi", layout="wide")
+# --- 1. APP CONFIGURATION ---
+st.set_page_config(page_title="SmartRoute Nairobi", layout="wide", page_icon="🚚")
 
-# --- 2. DATABASE FUNCTIONS ---
+# Initialize Session State
+if 'logged_in' not in st.session_state:
+    st.session_state.update({
+        'logged_in': False, 
+        'username': None, 
+        'role': 'client', 
+        'zip_url': "https://github.com/example/model.zip"
+    })
+
+# --- 2. DATABASE UTILITIES ---
 def get_connection():
-    """Returns a connection object to your Aiven database using st.secrets."""
     try:
         return psycopg2.connect(st.secrets["DB_URL"])
     except Exception as e:
-        # We don't use st.error here because this function is called inside other logic
         return None
-
-def force_db_setup():
-    """Bypasses Aiven Web UI restrictions to create tables via Python."""
-    conn = get_connection()
-    if not conn:
-        st.error("Could not connect to database for setup.")
-        return
-        
-    try:
-        cur = conn.cursor()
-        # Create Users Table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT DEFAULT 'client'
-            );
-        """)
-        
-        # Create Activity Logs Table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS activity_logs (
-                id SERIAL PRIMARY KEY,
-                username TEXT,
-                action TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-
-        # Create a Default Admin Account
-        admin_user = "admin123"
-        admin_pass = generate_password_hash("nairobi2026")
-        cur.execute("""
-            INSERT INTO users (username, password_hash, role)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (username) DO NOTHING;
-        """, (admin_user, admin_pass, 'admin'))
-        
-        conn.commit()
-        st.success("✅ Success! Database tables created and Admin (admin123) added.")
-    except Exception as e:
-        st.error(f"❌ Force Setup Failed: {e}")
-    finally:
-        cur.close()
-        conn.close()
 
 def log_activity(username, action):
     conn = get_connection()
@@ -76,70 +37,137 @@ def log_activity(username, action):
         except:
             pass
 
-# --- 3. SESSION STATE ---
-if 'logged_in' not in st.session_state:
-    st.session_state.update({
-        'logged_in': False, 
-        'username': None, 
-        'role': 'client', 
-        'zip_url': "https://github.com/latest/download/model.zip"
-    })
+def force_db_setup():
+    conn = get_connection()
+    if not conn:
+        st.error("Connection failed. Check Secrets.")
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT, role TEXT DEFAULT 'client')")
+        cur.execute("CREATE TABLE IF NOT EXISTS activity_logs (id SERIAL PRIMARY KEY, username TEXT, action TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        # Default Admin
+        admin_pw = generate_password_hash("nairobi2026")
+        cur.execute("INSERT INTO users (username, password_hash, role) VALUES ('admin123', %s, 'admin') ON CONFLICT DO NOTHING", (admin_pw,))
+        conn.commit()
+        st.success("Database Initialized! Admin: admin123 | Pass: nairobi2026")
+    except Exception as e:
+        st.error(f"Setup Error: {e}")
+    finally:
+        conn.close()
 
-# --- 4. MAIN INTERFACE ---
-def main():
-    if not st.session_state.logged_in:
-        st.title("🚚 Nairobi SmartRoute Login")
-        
-        # 1. Connection Status Check
-        conn = get_connection()
-        if conn:
-            st.success("✅ Connected to Aiven Database")
-            conn.close()
-        else:
-            st.error("❌ Database not connected. Check Streamlit Secrets.")
+# --- 3. UI SECTIONS ---
 
-        # 2. Auth Form
-        with st.form("auth_form"):
+def login_page():
+    st.title("🚚 Nairobi SmartRoute")
+    st.subheader("Login or Register to access the Optimizer")
+    
+    tab1, tab2 = st.tabs(["Login", "Register"])
+    
+    with tab1:
+        with st.form("login_form"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
-            mode = st.radio("Mode", ["Login", "Register"])
-            submit = st.form_submit_button("Submit")
-            
-            if submit:
+            if st.form_submit_button("Log In"):
+                conn = get_connection()
+                if conn:
+                    cur = conn.cursor(cursor_factory=RealDictCursor)
+                    cur.execute("SELECT * FROM users WHERE username = %s", (u,))
+                    user = cur.fetchone()
+                    if user and check_password_hash(user['password_hash'], p):
+                        st.session_state.logged_in = True
+                        st.session_state.username = user['username']
+                        st.session_state.role = user['role']
+                        log_activity(u, "Logged In")
+                        st.rerun()
+                    else:
+                        st.error("Invalid Username or Password")
+                    conn.close()
+
+    with tab2:
+        with st.form("reg_form"):
+            new_u = st.text_input("New Username")
+            new_p = st.text_input("New Password", type="password")
+            if st.form_submit_button("Register Account"):
                 conn = get_connection()
                 if conn:
                     try:
-                        cur = conn.cursor(cursor_factory=RealDictCursor)
-                        if mode == "Login":
-                            # SAFE QUERY: Checks if table exists first
-                            cur.execute("SELECT * FROM users WHERE username = %s", (u,))
-                            user = cur.fetchone()
-                            if user and check_password_hash(user['password_hash'], p):
-                                st.session_state.logged_in = True
-                                st.session_state.username = user['username']
-                                st.session_state.role = user['role']
-                                log_activity(u, "Logged In")
-                                st.rerun()
-                            else:
-                                st.error("Invalid credentials")
-                        else:
-                            # Registration Logic
-                            cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", 
-                                        (u, generate_password_hash(p)))
-                            conn.commit()
-                            st.success("Registered! Switch to Login mode.")
-                        cur.close()
-                        conn.close()
-                    except psycopg2.errors.UndefinedTable:
-                        st.error("⚠️ Database tables not found! Please click the 'Initialize' button below.")
-                    except Exception as e:
-                        st.error(f"An error occurred: {e}")
-        
-        # 3. The Emergency Button
-        st.divider()
-        st.info("First time setting up? Use the button below to create your database tables.")
-        if st.button("🛠 System: Initialize Database & Admin"):
+                        cur = conn.cursor()
+                        cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", (new_u, generate_password_hash(new_p)))
+                        conn.commit()
+                        st.success("Account created! Please switch to Login tab.")
+                    except:
+                        st.error("Username already exists.")
+                    conn.close()
+
+    st.divider()
+    with st.expander("System Administration"):
+        if st.button("Initialize Database Tables"):
             force_db_setup()
 
-if __name__ == "__main__":
-    main()
+def main_dashboard():
+    # Sidebar Navigation
+    st.sidebar.title(f"Welcome, {st.session_state.username}")
+    nav = ["Route Optimizer"]
+    if st.session_state.role == 'admin':
+        nav.append("Admin Console")
+    
+    choice = st.sidebar.radio("Navigation", nav)
+    
+    if st.sidebar.button("Log Out"):
+        st.session_state.logged_in = False
+        st.rerun()
+
+    # PAGE 1: ROUTE OPTIMIZER
+    if choice == "Route Optimizer":
+        st.header("📍 Route Analysis & Comparison")
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            origin = st.text_input("Origin", "Nairobi CBD", disabled=True)
+            destination = st.selectbox("Destination", ["Westlands", "Kasarani", "Karen", "Mombasa Road", "Upper Hill"])
+            analyze = st.button("Analyze Best Routes")
+            
+        with col2:
+            m = folium.Map(location=[-1.286389, 36.817223], zoom_start=12)
+            folium.Marker([-1.286389, 36.817223], popup="Start: CBD").add_to(m)
+            st_folium(m, width="100%", height=300, key="nairobi_map")
+
+        if analyze:
+            log_activity(st.session_state.username, f"Analyzed route to {destination}")
+            st.subheader(f"Comparisons for {destination}")
+            # Mock data based on your project requirements
+            results = pd.DataFrame({
+                "Route Option": ["Fastest (Highway)", "Shortest (Local)", "Eco (Bypass)"],
+                "Distance (km)": [8.4, 6.2, 11.5],
+                "Est. Time (ETA)": ["18 mins", "28 mins", "22 mins"],
+                "Traffic Density": ["Heavy", "Moderate", "Light"]
+            })
+            st.table(results)
+
+    # PAGE 2: ADMIN CONSOLE
+    elif choice == "Admin Console":
+        st.header("🛠 Administrator Dashboard")
+        
+        # Zipfile / Model Management
+        st.subheader("Project Model Management")
+        new_url = st.text_input("Update Model ZIP URL", st.session_state.zip_url)
+        if st.button("Apply New Model URL"):
+            st.session_state.zip_url = new_url
+            log_activity(st.session_state.username, f"Changed ZIP URL to {new_url}")
+            st.success("Model path updated successfully.")
+
+        # Interaction Logs
+        st.subheader("Website Interaction History")
+        conn = get_connection()
+        if conn:
+            logs_df = pd.read_sql("SELECT * FROM activity_logs ORDER BY timestamp DESC", conn)
+            st.dataframe(logs_df, use_container_width=True)
+            conn.close()
+
+# --- 4. APP ROUTING ---
+if st.session_state.logged_in:
+    main_dashboard()
+else:
+    login_page()
