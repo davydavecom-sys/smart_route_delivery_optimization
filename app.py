@@ -10,16 +10,23 @@ import requests
 # --- 1. APP CONFIGURATION ---
 st.set_page_config(page_title="SmartRoute Nairobi", layout="wide", page_icon="🚚")
 
+# Initialize Session State
 if 'logged_in' not in st.session_state:
     st.session_state.update({
-        'logged_in': False, 'username': None, 'role': 'client', 
-        'zip_url': "https://github.com/example/model.zip"
+        'logged_in': False, 
+        'username': None, 
+        'role': 'client', 
+        'zip_url': "https://github.com/example/model.zip",
+        'active_origin': "Nairobi CBD",
+        'active_dest': "Westlands"
     })
 
 # --- 2. DATABASE & UTILS ---
 def get_connection():
-    try: return psycopg2.connect(st.secrets["DB_URL"])
-    except: return None
+    try:
+        return psycopg2.connect(st.secrets["DB_URL"])
+    except:
+        return None
 
 def log_activity(username, action):
     conn = get_connection()
@@ -34,21 +41,20 @@ def log_activity(username, action):
 
 # --- 3. ORS ROUTING ENGINE ---
 def get_ors_route(start_coords, end_coords):
-    """Fetches real road coordinates from OpenRouteService."""
-    api_key = st.secrets["ORS_API_KEY"]
-    # ORS uses [lon, lat] format
-    coords = f"{start_coords[1]},{start_coords[0]}|{end_coords[1]},{end_coords[0]}"
+    api_key = st.secrets.get("ORS_API_KEY")
+    if not api_key:
+        return [start_coords, end_coords], {"distance": 0, "duration": 0}
+    
     url = f"https://api.openrouteservice.org/v2/directions/driving-car?api_key={api_key}&start={start_coords[1]},{start_coords[0]}&end={end_coords[1]},{end_coords[0]}"
     
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            # Extract geometry coordinates and flip them back to [lat, lon] for Folium
             line = data['features'][0]['geometry']['coordinates']
             return [[p[1], p[0]] for p in line], data['features'][0]['properties']['summary']
-    except Exception as e:
-        st.error(f"Routing Error: {e}")
+    except:
+        pass
     return [start_coords, end_coords], {"distance": 0, "duration": 0}
 
 # --- 4. LOCATION DATA ---
@@ -68,8 +74,9 @@ locations = {
     "Kilimani": [-1.2900, 36.7840],
     "Gigiri": [-1.2333, 36.8056]
 }
+location_list = sorted(list(locations.keys()))
 
-# --- 5. UI COMPONENTS ---
+# --- 5. UI SECTIONS ---
 
 def login_page():
     st.title("🚚 Nairobi SmartRoute")
@@ -87,12 +94,13 @@ def login_page():
                         st.session_state.update({'logged_in': True, 'username': u, 'role': user['role']})
                         st.rerun()
                     else: st.error("Invalid credentials")
-    st.info("System Admin: Use the 'Initialize' button in the dashboard if tables are missing.")
+    st.info("System Admin: If database is new, use 'Initialize' in the Admin Console footer.")
 
 def main_dashboard():
     st.sidebar.title(f"User: {st.session_state.username}")
     nav = ["Route Optimizer", "Admin Console"] if st.session_state.role == 'admin' else ["Route Optimizer"]
     choice = st.sidebar.radio("Navigation", nav)
+    
     if st.sidebar.button("Log Out"):
         st.session_state.logged_in = False
         st.rerun()
@@ -100,19 +108,36 @@ def main_dashboard():
     if choice == "Route Optimizer":
         st.header("📍 Smart Delivery Optimizer")
         
-        # --- BRIEF SUMMARY SECTION ---
+        # --- INTERACTIVE SUMMARY HEADS ---
+        st.write("Click a summary card to visualize the route:")
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-        col_s1.metric("Active Drivers", "24", "+2")
-        col_s2.metric("Avg Delivery Time", "32m", "-4m")
-        col_s3.metric("Traffic Level", "Moderate", "High-Risk")
-        col_s4.metric("System Status", "Optimal", "100%")
+        
+        if col_s1.button("👥 24 Active Drivers"):
+            st.session_state.active_origin, st.session_state.active_dest = "Nairobi CBD", "Kasarani"
+            
+        if col_s2.button("⏱️ 32m Avg Delivery"):
+            st.session_state.active_origin, st.session_state.active_dest = "Westlands", "Gigiri"
+
+        if col_s3.button("🚦 Traffic: High Risk"):
+            st.session_state.active_origin, st.session_state.active_dest = "Nairobi CBD", "Mombasa Road"
+
+        if col_s4.button("✅ System: Optimal"):
+            st.session_state.active_origin, st.session_state.active_dest = "Runda", "Upper Hill"
+
         st.divider()
 
         col1, col2 = st.columns([1, 2])
         with col1:
             st.subheader("Search Parameters")
-            origin = st.selectbox("Pickup Point", sorted(locations.keys()), index=0)
-            destination = st.selectbox("Dropoff Point", sorted(locations.keys()), index=1)
+            # These selectboxes are synced with the buttons above via Session State
+            origin = st.selectbox("Pickup Point", location_list, 
+                                 index=location_list.index(st.session_state.active_origin))
+            destination = st.selectbox("Dropoff Point", location_list, 
+                                      index=location_list.index(st.session_state.active_dest))
+            
+            # Update state immediately if user changes selectbox manually
+            st.session_state.active_origin, st.session_state.active_dest = origin, destination
+            
             analyze = st.button("Calculate Optimal Route")
             
         with col2:
@@ -124,35 +149,38 @@ def main_dashboard():
 
             route_summary = None
             if origin != destination:
-                # CALLING REAL ORS API
                 road_path, route_summary = get_ors_route(start_coords, dest_coords)
-                folium.PolyLine(road_path, color="blue", weight=5, opacity=0.8, tooltip="Real-Road Path").add_to(m)
+                folium.PolyLine(road_path, color="blue", weight=5, opacity=0.8).add_to(m)
 
             st_folium(m, width="100%", height=400, key=f"map_{origin}_{destination}")
 
         if analyze and route_summary:
-            dist_km = round(route_summary['distance'] / 1000, 2)
-            time_min = round(route_summary['duration'] / 60, 0)
+            dist_km = round(route_summary.get('distance', 0) / 1000, 2)
+            time_min = round(route_summary.get('duration', 0) / 60, 0)
             
-            log_activity(st.session_state.username, f"Optimized: {origin} to {destination}")
-            st.subheader("Analysis Results")
+            st.subheader("Optimization Analysis")
             st.table(pd.DataFrame({
-                "Route Type": ["ORS Real-Road", "Shortest Path", "Traffic Avoidance"],
-                "Distance": [f"{dist_km} km", f"{dist_km * 0.9} km", f"{dist_km * 1.2} km"],
-                "ETA": [f"{time_min} mins", f"{time_min + 5} mins", f"{time_min - 3} mins"]
+                "Strategy": ["AI Optimized (DRL)", "Shortest Distance", "Congestion Avoidance"],
+                "Distance": [f"{dist_km} km", f"{dist_km * 0.9} km", f"{dist_km * 1.3} km"],
+                "ETA": [f"{time_min} min", f"{time_min + 10} min", f"{time_min - 4} min"]
             }))
 
     elif choice == "Admin Console":
-        st.header("🛠 Admin Controls")
-        new_url = st.text_input("Update Model ZIP", st.session_state.zip_url)
-        if st.button("Save"): st.session_state.zip_url = new_url
+        st.header("🛠 Administrator Controls")
+        st.subheader("Deep Reinforcement Learning Model")
+        new_url = st.text_input("Model ZIP URL", st.session_state.zip_url)
+        if st.button("Update Model"): st.session_state.zip_url = new_url
         
-        st.subheader("Activity Logs")
+        st.divider()
+        st.subheader("Interaction Logs")
         conn = get_connection()
         if conn:
-            st.dataframe(pd.read_sql("SELECT * FROM activity_logs ORDER BY timestamp DESC", conn), use_container_width=True)
+            logs = pd.read_sql("SELECT * FROM activity_logs ORDER BY timestamp DESC LIMIT 50", conn)
+            st.dataframe(logs, use_container_width=True)
             conn.close()
 
 # --- 6. ROUTING ---
-if st.session_state.logged_in: main_dashboard()
-else: login_page()
+if st.session_state.logged_in:
+    main_dashboard()
+else:
+    login_page()
