@@ -9,6 +9,20 @@ from streamlit_folium import st_folium
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="SmartRoute Nairobi", layout="wide")
 
+import streamlit as st
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+def get_connection():
+    """Returns a connection object to your Aiven database."""
+    try:
+        # Accesses the URL from your Secrets
+        conn = psycopg2.connect(st.secrets["DB_URL"])
+        return conn
+    except Exception as e:
+        st.error(f"Failed to connect to the database: {e}")
+        return None
+
 # --- 2. DATABASE REPAIR (FORCING WRITE ACCESS) ---
 def force_db_setup():
     """Bypasses Aiven Web UI restrictions to create tables via Python."""
