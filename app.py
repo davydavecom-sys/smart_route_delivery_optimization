@@ -26,26 +26,36 @@ def get_connection():
     try: 
         return psycopg2.connect(st.secrets["DB_URL"])
     except: 
+        st.error("Database Connection Error. Check your Streamlit Secrets.")
         return None
 
 def init_db():
     conn = get_connection()
     if conn:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username TEXT UNIQUE,
-                password_hash TEXT,
-                role TEXT DEFAULT 'client'
-            )
-        """)
-        admin_hash = generate_password_hash("nairobi2026")
-        cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", 
-                    ("admin123", admin_hash, "admin"))
-        conn.commit()
-        cur.close()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            # Create table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT UNIQUE,
+                    password_hash TEXT,
+                    role TEXT DEFAULT 'client'
+                )
+            """)
+            # FIX: Ensure the column is TEXT to prevent password truncation
+            cur.execute("ALTER TABLE users ALTER COLUMN password_hash TYPE TEXT")
+            
+            # Create default admin
+            admin_hash = generate_password_hash("nairobi2026")
+            cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", 
+                        ("admin123", admin_hash, "admin"))
+            conn.commit()
+        except Exception as e:
+            st.error(f"Initialization Error: {e}")
+        finally:
+            cur.close()
+            conn.close()
 
 init_db()
 
@@ -71,36 +81,39 @@ def auth_page():
     
     with tab1:
         with st.form("login_form"):
-            u = st.text_input("Username")
-            p = st.text_input("Password", type="password")
+            u = st.text_input("Username").strip()
+            p = st.text_input("Password", type="password").strip()
             if st.form_submit_button("Enter Dashboard"):
                 conn = get_connection()
                 if conn:
                     cur = conn.cursor(cursor_factory=RealDictCursor)
                     cur.execute("SELECT * FROM users WHERE username = %s", (u,))
                     user = cur.fetchone()
+                    conn.close()
                     if user and check_password_hash(user['password_hash'], p):
                         st.session_state.update({'logged_in': True, 'user': u, 'role': user['role']})
                         st.rerun()
-                    else: st.error("Invalid credentials.")
-                    conn.close()
+                    else: st.error("Invalid Username or Password")
 
     with tab2:
         st.info("New accounts are registered as standard Drivers.")
         with st.form("register_form"):
-            new_u = st.text_input("Username")
-            new_p = st.text_input("Password", type="password")
+            new_u = st.text_input("Username").strip()
+            new_p = st.text_input("Password", type="password").strip()
             if st.form_submit_button("Create Driver Account"):
-                conn = get_connection()
-                if conn and new_u and new_p:
-                    try:
-                        cur = conn.cursor()
-                        cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'client')", 
-                                    (new_u, generate_password_hash(new_p)))
-                        conn.commit()
-                        st.success("Account created! Switch to Login tab.")
-                    except: st.error("Username already exists.")
-                    finally: conn.close()
+                if new_u and new_p:
+                    conn = get_connection()
+                    if conn:
+                        try:
+                            cur = conn.cursor()
+                            hashed = generate_password_hash(new_p)
+                            cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'client')", 
+                                        (new_u, hashed))
+                            conn.commit()
+                            st.success("Account created! You can now log in.")
+                        except: st.error("Username already exists.")
+                        finally: conn.close()
+                else: st.warning("Please provide both username and password.")
 
 # --- 5. MAIN DASHBOARD ---
 def main_dashboard():
@@ -108,17 +121,14 @@ def main_dashboard():
     st.sidebar.caption(f"Role: {st.session_state.role.upper()}")
     
     menu = ["Route Optimizer"]
-    if st.session_state.role == "admin":
-        menu.append("Admin Dashboard")
-    
+    if st.session_state.role == "admin": menu.append("Admin Dashboard")
     choice = st.sidebar.radio("Menu", menu)
     
     if st.sidebar.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.path_to_draw = None # Clear path on logout
+        st.session_state.update({'logged_in': False, 'path_to_draw': None, 'stats_to_show': None})
         st.rerun()
 
-    # GPS Fetch
+    # GPS Logic
     loc_data = streamlit_js_eval(js_expressions="navigator.geolocation.getCurrentPosition(pos => {return [pos.coords.latitude, pos.coords.longitude]})", target_id='get_loc', key="GPS_FETCH")
     if loc_data and (NAIROBI_BOUNDS["lat_min"] <= loc_data[0] <= NAIROBI_BOUNDS["lat_max"]):
         st.session_state.origin_coords = loc_data
@@ -140,7 +150,6 @@ def main_dashboard():
         with c1:
             start = st.selectbox("Start Node", full_list)
             stops = st.multiselect("Destinations", [k for k in full_list if k != start])
-            
             if st.button("🚀 Optimize Path", use_container_width=True):
                 full_trip = [locations[start]] + [locations[s] for s in stops]
                 if len(full_trip) >= 2:
@@ -157,8 +166,7 @@ def main_dashboard():
         with c2:
             m = folium.Map(location=locations[start], zoom_start=12)
             folium.Marker(locations[start], icon=folium.Icon(color='green', icon='play')).add_to(m)
-            for s in stops:
-                folium.Marker(locations[s], icon=folium.Icon(color='blue', icon='info-sign')).add_to(m)
+            for s in stops: folium.Marker(locations[s], icon=folium.Icon(color='blue', icon='info-sign')).add_to(m)
             
             if st.session_state.path_to_draw:
                 folium.PolyLine(st.session_state.path_to_draw, color="#1f77b4", weight=6, opacity=0.8).add_to(m)
@@ -168,12 +176,11 @@ def main_dashboard():
     elif choice == "Admin Dashboard":
         st.header("🛠 Administrator Control Panel")
         adm_tab1, adm_tab2 = st.tabs(["User Management", "System Health"])
-        
         with adm_tab1:
             st.subheader("Register New Administrator")
             with st.form("admin_reg"):
-                adm_u = st.text_input("New Admin Username")
-                adm_p = st.text_input("New Admin Password", type="password")
+                adm_u = st.text_input("New Admin Username").strip()
+                adm_p = st.text_input("New Admin Password", type="password").strip()
                 if st.form_submit_button("Create Admin Account"):
                     conn = get_connection()
                     if conn and adm_u and adm_p:
@@ -182,10 +189,9 @@ def main_dashboard():
                             cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')", 
                                         (adm_u, generate_password_hash(adm_p)))
                             conn.commit()
-                            st.success(f"Admin '{adm_u}' created.")
-                        except: st.error("Error creating account.")
+                            st.success(f"Admin account created for {adm_u}.")
+                        except: st.error("Database error or username taken.")
                         finally: conn.close()
-            
             st.divider()
             st.subheader("Active System Users")
             conn = get_connection()
